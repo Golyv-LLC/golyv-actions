@@ -38,8 +38,12 @@ name: Deploy dev
 on:
   push:
     branches: [dev]
+permissions:
+  id-token: write   # required: build-deploy.yml federates to AWS via OIDC,
+  contents: read    # and a called workflow can only narrow the caller's token
 jobs:
   deploy:
+    if: vars.GOLYV_CI_ENABLED == 'true'
     uses: Golyv-LLC/golyv-actions/.github/workflows/build-deploy.yml@v1
     with:
       image-name: hospital-backend-dev
@@ -59,6 +63,7 @@ jobs:
 
 | Name | Kind | Purpose |
 |---|---|---|
+| `GOLYV_CI_ENABLED` | variable | Master cutover switch. Every consuming job is gated on `vars.GOLYV_CI_ENABLED == 'true'`, so workflows sit inert until this is set. Setting it org-wide turns the whole estate on; unsetting it is the rollback. |
 | `AWS_OIDC_ROLE_ARN` | variable | IAM role assumed via OIDC to push to ECR |
 | `GOLYV_CI_APP_ID` | secret | `golyv-ci` GitHub App id |
 | `GOLYV_CI_APP_PRIVATE_KEY` | secret | `golyv-ci` GitHub App private key |
@@ -98,3 +103,15 @@ pathlib.Path('/tmp/bump.sh').write_text('#!/usr/bin/env bash\n'+s['run'])"
 ```
 
 then run it against a scratch clone of `golyv-charts` with a local bare remote.
+
+## Gotchas
+
+**Callers must declare `permissions`.** A reusable workflow can only *reduce* the
+caller's token scopes, never widen them. `build-deploy.yml` needs
+`id-token: write` for OIDC, so any workflow calling it must grant that itself —
+otherwise the run dies at `startup_failure` before a single step executes, with
+no log to explain why.
+
+**Everything is gated on `GOLYV_CI_ENABLED`.** Workflows were installed while
+GitLab CI was still the live system, so every job carries
+`if: vars.GOLYV_CI_ENABLED == 'true'` and skips until that org variable is set.
