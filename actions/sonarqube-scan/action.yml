@@ -48,13 +48,18 @@ runs:
         # The scanner image runs as its own user, which cannot write into the
         # bind-mounted workspace (owned by the runner user). GitLab never hit
         # this because the job itself *was* the container. Run as the runner
-        # user so SONAR_USER_HOME under the workspace is writable.
+        # user so SONAR_USER_HOME under the workspace is writable. For the same
+        # reason the scanner work directory is redirected into the workspace:
+        # its default (/tmp/.scannerwork) is not writable by that user.
         docker run --rm \
           --user "$(id -u):$(id -g)" \
           -e SONAR_TOKEN \
           -e SONAR_HOST_URL \
           -e SONAR_USER_HOME=/usr/src/.sonar \
+          -e HOME=/usr/src \
           -v "$GITHUB_WORKSPACE:/usr/src" \
           -w /usr/src \
           "$SCANNER_IMAGE" \
-          sonar-scanner $EXTRA_ARGS
+          sonar-scanner \
+            -Dsonar.working.directory=/usr/src/.scannerwork \
+            $EXTRA_ARGS
