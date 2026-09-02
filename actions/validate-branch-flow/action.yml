@@ -1,0 +1,90 @@
+name: Validate branch flow
+description: >-
+  Fail a pull request whose source branch is not allowed to merge into its target
+  branch. Ports the `validate-branch-flow` / `only-allow-dev-merge` check jobs.
+
+inputs:
+  rules:
+    description: >-
+      Newline-separated rules, one per target branch, in the form
+      `target: pattern, pattern, ...`. Patterns are shell globs matched against
+      the source branch. A target branch with no rule is unrestricted, which is
+      how the GitLab jobs behaved.
+
+      Example (hospital-backend):
+        main: uat, cherry-pick-into-main/*
+        uat:  dev, cherry-pick-into-uat/*
+        dev:  hotfix/*, feat/HOS-*
+    required: true
+  base-ref:
+    description: Target branch. Defaults to the PR base.
+    required: false
+    default: ${{ github.base_ref }}
+  head-ref:
+    description: Source branch. Defaults to the PR head.
+    required: false
+    default: ${{ github.head_ref }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check merge direction
+      shell: bash
+      env:
+        RULES: ${{ inputs.rules }}
+        TARGET: ${{ inputs.base-ref }}
+        SOURCE: ${{ inputs.head-ref }}
+      run: |
+        set -uo pipefail
+        echo "Target branch: $TARGET"
+        echo "Source branch: $SOURCE"
+
+        if [ -z "$TARGET" ] || [ -z "$SOURCE" ]; then
+          echo "::error::Not a pull request context; no branches to validate."
+          exit 1
+        fi
+
+        allowed=""
+        found=0
+        while IFS= read -r line; do
+          line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          [ -z "$line" ] && continue
+          rule_target="${line%%:*}"
+          rule_target="$(printf '%s' "$rule_target" | sed -e 's/[[:space:]]*$//')"
+          [ "$rule_target" = "$TARGET" ] || continue
+          allowed="${line#*:}"
+          found=1
+          break
+        done <<< "$RULES"
+
+        if [ "$found" -eq 0 ]; then
+          echo "No rule for target '$TARGET' — nothing to enforce."
+          exit 0
+        fi
+
+        IFS=',' read -ra patterns <<< "$allowed"
+        for p in "${patterns[@]}"; do
+          p="$(printf '%s' "$p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          [ -z "$p" ] && continue
+          # shellcheck disable=SC2053
+          if [[ "$SOURCE" == $p ]]; then
+            echo "Allowed merge into $TARGET (matched '$p')"
+            {
+              echo "### Branch flow OK"
+              echo ""
+              echo "\`$SOURCE\` -> \`$TARGET\` matched allowed pattern \`$p\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+        done
+
+        clean="$(printf '%s' "$allowed" | sed -e 's/^[[:space:]]*//')"
+        echo "::error::Only [$clean] may merge into '$TARGET' (got '$SOURCE')"
+        {
+          echo "### Branch flow violation"
+          echo ""
+          echo "\`$SOURCE\` is not allowed to merge into \`$TARGET\`."
+          echo ""
+          echo "Allowed sources: \`$clean\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit 1

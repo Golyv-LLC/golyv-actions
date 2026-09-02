@@ -1,0 +1,55 @@
+name: SonarQube scan
+description: >-
+  Run sonar-scanner against the checked-out project. Ports the `sonarqube-check`
+  jobs, including their non-blocking behaviour (`allow_failure: true`).
+
+inputs:
+  sonar-token:
+    description: SonarQube token
+    required: true
+  sonar-host-url:
+    description: SonarQube server URL
+    required: true
+  scanner-image:
+    description: sonar-scanner CLI image
+    required: false
+    default: sonarsource/sonar-scanner-cli:latest
+  args:
+    description: Extra arguments passed to sonar-scanner
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # sonar needs full history to attribute blame and compute new-code periods.
+    # This mirrors GIT_DEPTH: "0" in the GitLab jobs.
+    - name: Fetch full history
+      shell: bash
+      run: git fetch --unshallow || git fetch --all || true
+
+    - name: Cache scanner data
+      uses: actions/cache@v4
+      with:
+        path: .sonar/cache
+        key: sonar-${{ runner.os }}-${{ github.repository }}
+        restore-keys: sonar-${{ runner.os }}-
+
+    - name: Run sonar-scanner
+      shell: bash
+      env:
+        SONAR_TOKEN: ${{ inputs.sonar-token }}
+        SONAR_HOST_URL: ${{ inputs.sonar-host-url }}
+        SCANNER_IMAGE: ${{ inputs.scanner-image }}
+        EXTRA_ARGS: ${{ inputs.args }}
+      run: |
+        set -uo pipefail
+        mkdir -p .sonar/cache
+        docker run --rm \
+          -e SONAR_TOKEN \
+          -e SONAR_HOST_URL \
+          -e SONAR_USER_HOME=/usr/src/.sonar \
+          -v "$GITHUB_WORKSPACE:/usr/src" \
+          -w /usr/src \
+          "$SCANNER_IMAGE" \
+          sonar-scanner $EXTRA_ARGS

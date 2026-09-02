@@ -1,0 +1,76 @@
+name: Trivy image scan
+description: >-
+  Scan a pushed image for vulnerabilities and upload the report as an artifact.
+  Ports ondemand-backend's informational Trivy step; non-blocking by design.
+
+inputs:
+  image-uri:
+    description: Fully-qualified image URI to scan
+    required: true
+  severity:
+    description: Comma-separated severities to report
+    required: false
+    default: CRITICAL,HIGH,MEDIUM
+  trivy-version:
+    description: Trivy release to install
+    required: false
+    default: 0.69.3
+  artifact-name:
+    description: Name of the uploaded report artifact
+    required: false
+    default: trivy-report
+  retention-days:
+    description: Artifact retention
+    required: false
+    default: '7'
+
+runs:
+  using: composite
+  steps:
+    - name: Install Trivy
+      shell: bash
+      env:
+        TRIVY_VERSION: ${{ inputs.trivy-version }}
+      run: |
+        set -euo pipefail
+        curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+          | sudo tar xz -C /usr/local/bin trivy
+        trivy --version
+
+    - name: Scan image
+      shell: bash
+      env:
+        IMAGE_URI: ${{ inputs.image-uri }}
+        SEVERITY: ${{ inputs.severity }}
+      run: |
+        set -uo pipefail
+        # Registry auth comes from the docker config written by amazon-ecr-login,
+        # which must have run earlier in the job.
+        trivy image --severity "$SEVERITY" --no-progress \
+          --format json --output trivy-report.json "$IMAGE_URI" || true
+        trivy image --severity "$SEVERITY" --no-progress \
+          --format table "$IMAGE_URI" || true
+
+    - name: Summarise
+      shell: bash
+      run: |
+        set -uo pipefail
+        [ -f trivy-report.json ] || exit 0
+        {
+          echo "### Trivy scan"
+          echo ""
+          echo "| Severity | Count |"
+          echo "|---|---|"
+          jq -r '[.Results[]?.Vulnerabilities[]?.Severity] | group_by(.) | .[]
+                 | "| \(.[0]) | \(length) |"' trivy-report.json 2>/dev/null \
+            || echo "| (report unreadable) | - |"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: trivy-report.json
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ignore

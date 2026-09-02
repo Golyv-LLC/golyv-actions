@@ -1,0 +1,67 @@
+name: Validate pull request
+
+# PR gate: branch-flow rules plus an optional SonarQube scan. The GitHub Actions
+# equivalent of the GitLab `check` and `sonarqube` stages.
+
+on:
+  workflow_call:
+    inputs:
+      branch-rules:
+        description: >-
+          Newline-separated `target: pattern, pattern` rules. Omit to skip the
+          branch-flow check.
+        type: string
+        required: false
+        default: ''
+      run-sonar:
+        type: boolean
+        required: false
+        default: false
+      actions-ref:
+        type: string
+        required: false
+        default: v1
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  branch-flow:
+    if: inputs.branch-rules != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout shared actions
+        uses: actions/checkout@v4
+        with:
+          repository: Golyv-LLC/golyv-actions
+          ref: ${{ inputs.actions-ref }}
+          path: .golyv-actions
+      - uses: ./.golyv-actions/actions/validate-branch-flow
+        with:
+          rules: ${{ inputs.branch-rules }}
+
+  sonarqube:
+    if: inputs.run-sonar
+    runs-on: ubuntu-latest
+    # Matches GitLab's `allow_failure: true` — the scan reports but never blocks.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Checkout shared actions
+        uses: actions/checkout@v4
+        with:
+          repository: Golyv-LLC/golyv-actions
+          ref: ${{ inputs.actions-ref }}
+          path: .golyv-actions
+      - uses: ./.golyv-actions/actions/sonarqube-scan
+        with:
+          sonar-token: ${{ secrets.SONAR_TOKEN }}
+          sonar-host-url: ${{ secrets.SONAR_HOST_URL }}

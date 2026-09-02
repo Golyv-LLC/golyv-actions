@@ -1,0 +1,159 @@
+name: Build and deploy
+
+# The standard Golyv application pipeline: build an image, push it to ECR, then
+# bump the tag in golyv-charts so ArgoCD rolls it out. This is the GitHub Actions
+# equivalent of the GitLab `build-and-push` + `update-values` stages.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: ECR repository name
+        type: string
+        required: true
+      aws-role:
+        description: IAM role ARN to assume via OIDC
+        type: string
+        required: true
+      dockerfile:
+        description: Dockerfile path relative to the build context
+        type: string
+        required: false
+        default: Dockerfile
+      context:
+        description: Build context
+        type: string
+        required: false
+        default: .
+      aws-region:
+        type: string
+        required: false
+        default: eu-west-1
+      ecr-registry:
+        type: string
+        required: false
+        default: 749087126681.dkr.ecr.eu-west-1.amazonaws.com
+      env-secret-id:
+        description: Secrets Manager id to materialise as .env before building
+        type: string
+        required: false
+        default: ''
+      run-trivy:
+        type: boolean
+        required: false
+        default: true
+      chart-files:
+        description: >-
+          Newline-separated values files or globs to bump. Leave empty to build
+          and push the image without touching golyv-charts (ondemand-backend
+          builds on every branch but only deploys from two of them).
+        type: string
+        required: false
+        default: ''
+      chart-exclude:
+        description: Newline-separated exact paths to skip
+        type: string
+        required: false
+        default: ''
+      chart-set:
+        description: Newline-separated yq assignments, e.g. .backend.tag = strenv(TAG)
+        type: string
+        required: false
+        default: ''
+      chart-sed:
+        description: Newline-separated sed expressions for non-values files
+        type: string
+        required: false
+        default: ''
+      chart-branch:
+        type: string
+        required: false
+        default: dev
+      commit-message:
+        description: Charts commit message. Defaults to a generated one.
+        type: string
+        required: false
+        default: ''
+      actions-ref:
+        description: Ref of Golyv-LLC/golyv-actions to use
+        type: string
+        required: false
+        default: v1
+    secrets:
+      # Not required: callers that only build (empty chart-files) never mint a token.
+      GOLYV_CI_APP_ID:
+        required: false
+      GOLYV_CI_APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  id-token: write   # OIDC federation to AWS
+  contents: read
+
+concurrency:
+  # Serialise per repo+ref so two pushes cannot race each other's chart bump.
+  group: build-deploy-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout shared actions
+        uses: actions/checkout@v4
+        with:
+          repository: Golyv-LLC/golyv-actions
+          ref: ${{ inputs.actions-ref }}
+          path: .golyv-actions
+
+      - name: Build and push to ECR
+        id: image
+        uses: ./.golyv-actions/actions/ecr-build-push
+        with:
+          image-name: ${{ inputs.image-name }}
+          role-to-assume: ${{ inputs.aws-role }}
+          dockerfile: ${{ inputs.dockerfile }}
+          context: ${{ inputs.context }}
+          aws-region: ${{ inputs.aws-region }}
+          ecr-registry: ${{ inputs.ecr-registry }}
+          env-secret-id: ${{ inputs.env-secret-id }}
+
+      - name: Scan image
+        if: inputs.run-trivy
+        continue-on-error: true
+        uses: ./.golyv-actions/actions/trivy-scan
+        with:
+          image-uri: ${{ steps.image.outputs.image-uri }}
+          artifact-name: trivy-${{ inputs.image-name }}
+
+      # Short-lived, scoped to golyv-charts only. Replaces the long-lived
+      # GITLAB_PAT that every GitLab job carried.
+      - name: Mint charts token
+        if: inputs.chart-files != ''
+        id: charts-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GOLYV_CI_APP_ID }}
+          private-key: ${{ secrets.GOLYV_CI_APP_PRIVATE_KEY }}
+          owner: Golyv-LLC
+          repositories: golyv-charts
+
+      - name: Bump chart values
+        if: inputs.chart-files != ''
+        uses: ./.golyv-actions/actions/bump-chart-values
+        with:
+          token: ${{ steps.charts-token.outputs.token }}
+          image-tag: ${{ steps.image.outputs.image-tag }}
+          image-repo: ${{ inputs.ecr-registry }}/${{ inputs.image-name }}
+          branch: ${{ inputs.chart-branch }}
+          files: ${{ inputs.chart-files }}
+          exclude: ${{ inputs.chart-exclude }}
+          set: ${{ inputs.chart-set }}
+          sed: ${{ inputs.chart-sed }}
+          commit-message: >-
+            ${{ inputs.commit-message != ''
+                && inputs.commit-message
+                || format('Update {0} image to {1}', inputs.image-name, steps.image.outputs.image-tag) }}

@@ -1,0 +1,209 @@
+name: Bump chart values
+description: >-
+  Update image tags in the golyv-charts repository and push the change, so ArgoCD
+  picks up the new image. Ports the `update-values` / `update-chart` stages of the
+  GitLab pipelines.
+
+inputs:
+  token:
+    description: Token with contents:write on the charts repository
+    required: true
+  image-tag:
+    description: Image tag to write. Exposed to expressions as strenv(TAG).
+    required: true
+  image-repo:
+    description: >-
+      Fully-qualified image repository without the tag, e.g.
+      749087126681.dkr.ecr.eu-west-1.amazonaws.com/hospital-backend-dev.
+      Exposed to expressions as strenv(IMAGE).
+    required: false
+    default: ''
+  repository:
+    description: Charts repository
+    required: false
+    default: Golyv-LLC/golyv-charts
+  branch:
+    description: Branch to read and push to
+    required: false
+    default: dev
+  files:
+    description: >-
+      Newline-separated list of paths or globs, relative to the charts repo root,
+      to update. Globs that match nothing are skipped with a warning, matching the
+      GitLab jobs' behaviour.
+    required: true
+  exclude:
+    description: Newline-separated list of exact paths to skip
+    required: false
+    default: ''
+  set:
+    description: >-
+      Newline-separated yq assignment expressions applied to every matched file.
+      Use strenv(TAG), strenv(IMAGE) and strenv(IMAGE_URI) rather than shell
+      interpolation. Example: .backend.tag = strenv(TAG)
+    required: false
+    default: ''
+  sed:
+    description: >-
+      Newline-separated sed expressions applied to every matched file. For files
+      that are not Helm values (restaurants-whatsapp-agent edits a raw
+      deployment.yaml image line). $IMAGE, $TAG and $IMAGE_URI are expanded.
+    required: false
+    default: ''
+  commit-message:
+    description: Commit message
+    required: true
+  author-name:
+    description: Commit author name
+    required: false
+    default: golyv-ci
+  author-email:
+    description: Commit author email
+    required: false
+    default: ci@golyv.co
+  max-retries:
+    description: >-
+      Push attempts before giving up. Several repos bump the same branch
+      concurrently, so a rebase-and-retry loop is required.
+    required: false
+    default: '5'
+
+outputs:
+  changed:
+    description: '"true" when a commit was pushed, "false" when nothing changed'
+    value: ${{ steps.bump.outputs.changed }}
+  commit:
+    description: SHA of the pushed commit, empty when nothing changed
+    value: ${{ steps.bump.outputs.commit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout charts
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.branch }}
+        token: ${{ inputs.token }}
+        path: .golyv-charts
+        fetch-depth: 0
+        persist-credentials: true
+
+    - name: Install yq
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v yq >/dev/null && yq --version 2>&1 | grep -q 'mikefarah'; then
+          echo "yq already present: $(yq --version)"; exit 0
+        fi
+        sudo curl -sSfL -o /usr/local/bin/yq \
+          https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+        sudo chmod +x /usr/local/bin/yq
+        yq --version
+
+    - name: Apply updates and push
+      id: bump
+      shell: bash
+      working-directory: .golyv-charts
+      env:
+        TAG: ${{ inputs.image-tag }}
+        IMAGE: ${{ inputs.image-repo }}
+        IMAGE_URI: ${{ inputs.image-repo }}:${{ inputs.image-tag }}
+        FILES: ${{ inputs.files }}
+        EXCLUDE: ${{ inputs.exclude }}
+        SET_EXPRS: ${{ inputs.set }}
+        SED_EXPRS: ${{ inputs.sed }}
+        BRANCH: ${{ inputs.branch }}
+        MSG: ${{ inputs.commit-message }}
+        AUTHOR_NAME: ${{ inputs.author-name }}
+        AUTHOR_EMAIL: ${{ inputs.author-email }}
+        MAX_RETRIES: ${{ inputs.max-retries }}
+        CHARTS_REPO: ${{ inputs.repository }}
+      run: |
+        set -euo pipefail
+
+        # Trim leading/trailing whitespace without xargs, which would strip
+        # quotes and mangle backslashes inside yq/sed expressions.
+        trim() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+        # ---- resolve the file list ------------------------------------------
+        declare -a targets=()
+        while IFS= read -r pattern; do
+          pattern="$(trim "$pattern")"
+          [ -z "$pattern" ] && continue
+          matched=0
+          for f in $pattern; do
+            [ -f "$f" ] || continue
+            skip=0
+            while IFS= read -r ex; do
+              ex="$(trim "$ex")"
+              [ -n "$ex" ] && [ "$f" = "$ex" ] && { skip=1; echo "Skipping excluded file: $f"; break; }
+            done <<< "$EXCLUDE"
+            [ $skip -eq 1 ] && continue
+            targets+=("$f"); matched=1
+          done
+          [ $matched -eq 0 ] && echo "Warning: $pattern matched no files, skipping..."
+        done <<< "$FILES"
+
+        if [ ${#targets[@]} -eq 0 ]; then
+          echo "::error::No target files matched. Refusing to push an empty bump."
+          exit 1
+        fi
+        echo "Updating ${#targets[@]} file(s) to tag $TAG"
+
+        # ---- apply the edits -------------------------------------------------
+        for f in "${targets[@]}"; do
+          echo "  $f"
+          while IFS= read -r expr; do
+            expr="$(trim "$expr")"
+            [ -z "$expr" ] && continue
+            yq e -i "$expr" "$f"
+          done <<< "$SET_EXPRS"
+          while IFS= read -r expr; do
+            expr="$(trim "$expr")"
+            [ -z "$expr" ] && continue
+            # Explicit substitution; IMAGE_URI first so it is not clipped by IMAGE.
+            expr="${expr//\$IMAGE_URI/$IMAGE_URI}"
+            expr="${expr//\$TAG/$TAG}"
+            expr="${expr//\$IMAGE/$IMAGE}"
+            sed -i "$expr" "$f"
+          done <<< "$SED_EXPRS"
+        done
+
+        # ---- commit ----------------------------------------------------------
+        git config user.name  "$AUTHOR_NAME"
+        git config user.email "$AUTHOR_EMAIL"
+        git add -- "${targets[@]}"
+        if git diff --cached --quiet; then
+          echo "No changes to commit"
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "commit=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        git commit -m "$MSG"
+
+        # ---- push, rebasing on top of concurrent bumps -----------------------
+        n=0
+        until git push origin "HEAD:$BRANCH"; do
+          n=$((n+1))
+          if [ "$n" -ge "$MAX_RETRIES" ]; then
+            echo "::error::Failed to push after $n attempts"
+            exit 1
+          fi
+          echo "Push rejected (attempt $n/$MAX_RETRIES); rebasing onto origin/$BRANCH"
+          sleep $((n * 3))
+          git fetch origin "$BRANCH"
+          git rebase "origin/$BRANCH"
+        done
+
+        sha="$(git rev-parse HEAD)"
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+        echo "commit=$sha" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Charts bumped"
+          echo ""
+          echo "Tag \`$TAG\` written to:"
+          printf -- '- `%s`\n' "${targets[@]}"
+          echo ""
+          echo "Commit \`${sha:0:8}\` on \`$CHARTS_REPO@$BRANCH\`"
+        } >> "$GITHUB_STEP_SUMMARY"

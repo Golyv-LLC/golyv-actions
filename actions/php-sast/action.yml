@@ -1,0 +1,66 @@
+name: PHP SAST
+description: >-
+  Composer security audit plus PHPStan static analysis, reported as an artifact.
+  Ports ondemand-backend's `sast-checks` job; non-blocking by design.
+
+inputs:
+  php-version:
+    description: PHP version
+    required: false
+    default: '8.2'
+  phpstan-args:
+    description: Extra arguments for PHPStan
+    required: false
+    default: --no-progress
+  report-name:
+    description: Name of the uploaded report artifact
+    required: false
+    default: sast-report
+  retention-days:
+    description: Artifact retention
+    required: false
+    default: '30'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ inputs.php-version }}
+        tools: composer:v2
+
+    - name: Cache composer
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/composer
+        key: composer-${{ runner.os }}-${{ hashFiles('**/composer.lock') }}
+        restore-keys: composer-${{ runner.os }}-
+
+    - name: Install dependencies
+      shell: bash
+      run: composer install --no-interaction --no-progress --prefer-dist --no-scripts
+
+    - name: Composer audit and PHPStan
+      shell: bash
+      env:
+        PHPSTAN_ARGS: ${{ inputs.phpstan-args }}
+      run: |
+        set -uo pipefail
+        echo "=== Composer Security Audit ===" | tee sast-report.txt
+        composer audit 2>&1 | tee -a sast-report.txt || true
+        echo "=== PHPStan Static Analysis ===" | tee -a sast-report.txt
+        if [ -x ./vendor/bin/phpstan ]; then
+          ./vendor/bin/phpstan analyse $PHPSTAN_ARGS 2>&1 | tee -a sast-report.txt || true
+        else
+          echo "phpstan not installed, skipping" | tee -a sast-report.txt
+        fi
+
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: ${{ inputs.report-name }}
+        path: sast-report.txt
+        retention-days: ${{ inputs.retention-days }}
+        if-no-files-found: ignore
