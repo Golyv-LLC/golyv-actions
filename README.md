@@ -59,7 +59,12 @@ jobs:
       GOLYV_CI_APP_PRIVATE_KEY: ${{ secrets.GOLYV_CI_APP_PRIVATE_KEY }}
 ```
 
-## Required org configuration
+## Required configuration
+
+> **On the GitHub Free plan these must be set per repository, not on the org.**
+> Org-level secrets and variables only reach *public* repos on Free; in a private
+> repo they resolve to empty and every gated job silently skips. Set them on each
+> consuming repo until the org is on Team.
 
 | Name | Kind | Purpose |
 |---|---|---|
