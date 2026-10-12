@@ -1,0 +1,107 @@
+name: ECR promote
+description: >-
+  Promote an image that was already built and tested by adding a release tag to
+  its existing manifest. Nothing is rebuilt: production runs exactly the bytes
+  staging ran. Fails if the source tag was never built.
+
+inputs:
+  repository:
+    description: ECR repository name, e.g. rumbl-backend
+    required: true
+  source-tag:
+    description: Tag of the tested image, normally the 8-character commit SHA
+    required: true
+  target-tag:
+    description: Tag to add, normally the release version, e.g. v1.4.0
+    required: true
+  role-to-assume:
+    description: IAM role ARN to assume via GitHub OIDC
+    required: true
+  aws-region:
+    description: AWS region of the ECR registry
+    required: false
+    default: eu-west-1
+
+outputs:
+  digest:
+    description: Digest shared by the source and target tags
+    value: ${{ steps.promote.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-to-assume }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Promote
+      id: promote
+      shell: bash
+      env:
+        REPO: ${{ inputs.repository }}
+        SRC: ${{ inputs.source-tag }}
+        DST: ${{ inputs.target-tag }}
+        REGION: ${{ inputs.aws-region }}
+      run: |
+        set -euo pipefail
+
+        digest_of() {
+          aws ecr describe-images --region "$REGION" --repository-name "$REPO" \
+            --image-ids imageTag="$1" --query 'imageDetails[0].imageDigest' \
+            --output text 2>/dev/null || true
+        }
+
+        src_digest="$(digest_of "$SRC")"
+        if [ -z "$src_digest" ] || [ "$src_digest" = "None" ]; then
+          echo "::error::$REPO:$SRC does not exist. Only commits that were built and deployed to staging can be released. Tag a commit that staging has run."
+          exit 1
+        fi
+
+        # Idempotent re-runs: if the target already points at the same image,
+        # there is nothing to do. If it points elsewhere, refuse — on an
+        # immutable repository that tag can never be moved.
+        dst_digest="$(digest_of "$DST")"
+        if [ -n "$dst_digest" ] && [ "$dst_digest" != "None" ]; then
+          if [ "$dst_digest" = "$src_digest" ]; then
+            echo "$REPO:$DST already points at $src_digest — nothing to do."
+            echo "digest=$src_digest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::$REPO:$DST already exists with a different image ($dst_digest). Release tags are immutable; cut a new version."
+          exit 1
+        fi
+
+        # Re-put the same manifest under the new tag. The media type must be
+        # passed through: build-push-action publishes an OCI image index
+        # (image + provenance attestation), not a single Docker manifest.
+        aws ecr batch-get-image --region "$REGION" --repository-name "$REPO" \
+          --image-ids imageTag="$SRC" \
+          --query 'images[0].[imageManifest,imageManifestMediaType]' \
+          --output json > /tmp/ecr-promote.json
+        manifest="$(jq -r '.[0]' /tmp/ecr-promote.json)"
+        media_type="$(jq -r '.[1]' /tmp/ecr-promote.json)"
+
+        aws ecr put-image --region "$REGION" --repository-name "$REPO" \
+          --image-tag "$DST" \
+          --image-manifest "$manifest" \
+          --image-manifest-media-type "$media_type" >/dev/null
+
+        new_digest="$(digest_of "$DST")"
+        if [ "$new_digest" != "$src_digest" ]; then
+          echo "::error::Promotion produced digest $new_digest, expected $src_digest."
+          exit 1
+        fi
+
+        echo "digest=$src_digest" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Image promoted"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Repository | \`$REPO\` |"
+          echo "| From | \`$SRC\` |"
+          echo "| To | \`$DST\` |"
+          echo "| Digest | \`$src_digest\` (unchanged — nothing rebuilt) |"
+        } >> "$GITHUB_STEP_SUMMARY"
