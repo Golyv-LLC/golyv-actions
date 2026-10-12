@@ -16,19 +16,43 @@ actions/                      composite actions
   sonarqube-scan/             sonar-scanner, non-blocking
   trivy-scan/                 image vulnerability scan, non-blocking
   php-sast/                   composer audit + PHPStan, non-blocking
+  ecr-promote/                add a release tag to an existing image (v2)
 .github/workflows/            reusable workflows
-  build-deploy.yml            the standard app pipeline
-  validate-pr.yml             the standard PR gate
+  build-deploy.yml            build, push, bump staging values
+  release.yml                 promote a tested image to prod, no rebuild (v2)
+  validate-pr.yml             PR gate: branch flow, SAST, Sonar, image build
 ```
 
 ## Versioning
 
-Consumers pin the `v1` tag. Move `v1` forward for backwards-compatible changes;
-cut `v2` for anything that changes an input contract.
+| Tag | For | Notes |
+|---|---|---|
+| `v1` | existing pipelines (hospital, ondemand, whatsapp, …) | frozen; keeps working unchanged |
+| `v2` | new pipelines, starting with rumbl-backend | adds release promotion, `push-latest`, PR SAST/image build |
+
+Move a tag forward only for backwards-compatible changes. Anything that changes
+an input contract gets a new major tag.
 
 ```bash
-git tag -f v1 && git push -f origin v1
+git tag -f v2 && git push -f origin v2
 ```
+
+## Build once, promote to production (v2)
+
+Staging builds the image once, tagged with the 8-character commit SHA. A release
+does **not** rebuild. Pushing tag `v1.4.0` on a commit that staging already ran
+adds `v1.4.0` to that same image (`ecr-promote`), then writes it into the
+production instances' values. Production therefore runs the exact bytes staging
+tested.
+
+- Releasing a commit staging never built fails with a clear error. That is
+  deliberate: it is the "was this tested?" check.
+- Re-running a release is safe. If the tag already points at the same image,
+  nothing happens; if it points at a different one, the release refuses.
+- Images are OCI indexes (image + provenance attestation). `ecr-promote` passes
+  the manifest media type through, which `put-image` requires.
+- Use `push-latest: false` on repositories with **immutable** tags, or the second
+  build fails trying to move `latest`.
 
 ## Typical consumer
 
@@ -61,10 +85,14 @@ jobs:
 
 ## Required configuration
 
-> **On the GitHub Free plan these must be set per repository, not on the org.**
-> Org-level secrets and variables only reach *public* repos on Free; in a private
-> repo they resolve to empty and every gated job silently skips. Set them on each
-> consuming repo until the org is on Team.
+The org is on **GitHub Team**, so these are set **once at org level** with
+visibility `all` and reach every repository, including private ones. Don't
+duplicate them per repo.
+
+> Historical note: while the org was on Free, org-level values did not reach
+> private repos (they resolved to empty and gated jobs silently skipped), so
+> some older repos also carry repo-level copies. Those still work and take
+> precedence; remove them when convenient.
 
 | Name | Kind | Purpose |
 |---|---|---|

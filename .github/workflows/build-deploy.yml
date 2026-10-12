@@ -42,6 +42,13 @@ on:
         type: boolean
         required: false
         default: true
+      push-latest:
+        description: >-
+          Also push a moving `latest` tag. Must be false for repositories with
+          immutable tags, where re-pushing `latest` fails on the second build.
+        type: boolean
+        required: false
+        default: true
       chart-files:
         description: >-
           Newline-separated values files or globs to bump. Leave empty to build
@@ -78,7 +85,7 @@ on:
         description: Ref of Golyv-LLC/golyv-actions to use
         type: string
         required: false
-        default: v1
+        default: v2
     secrets:
       # Not required: callers that only build (empty chart-files) never mint a token.
       GOLYV_CI_APP_ID:
@@ -120,6 +127,7 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           ecr-registry: ${{ inputs.ecr-registry }}
           env-secret-id: ${{ inputs.env-secret-id }}
+          push-latest: ${{ inputs.push-latest }}
 
       - name: Scan image
         if: inputs.run-trivy

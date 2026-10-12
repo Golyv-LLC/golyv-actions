@@ -1,7 +1,8 @@
 name: Validate pull request
 
-# PR gate: branch-flow rules plus an optional SonarQube scan. The GitHub Actions
-# equivalent of the GitLab `check` and `sonarqube` stages.
+# PR gate: branch-flow rules, PHP SAST, an optional SonarQube scan, and an
+# optional Docker build that proves the image still builds before merge. The
+# GitHub Actions equivalent of the GitLab `check`, `sast` and `sonarqube` stages.
 
 on:
   workflow_call:
@@ -17,10 +18,29 @@ on:
         type: boolean
         required: false
         default: false
+      run-php-sast:
+        description: Run composer audit (and PHPStan when installed)
+        type: boolean
+        required: false
+        default: false
+      php-version:
+        description: >-
+          PHP version for the SAST job. Must match the app: dependencies of an
+          older framework will not install on a newer PHP.
+        type: string
+        required: false
+        default: '8.2'
+      dockerfile:
+        description: >-
+          Dockerfile to build (without pushing) to prove the image still builds.
+          Leave empty to skip.
+        type: string
+        required: false
+        default: ''
       actions-ref:
         type: string
         required: false
-        default: v1
+        default: v2
     secrets:
       SONAR_TOKEN:
         required: false
@@ -46,6 +66,23 @@ jobs:
         with:
           rules: ${{ inputs.branch-rules }}
 
+  php-sast:
+    if: inputs.run-php-sast
+    runs-on: ubuntu-latest
+    # Reports, never blocks — matches GitLab's `allow_failure: true`.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout shared actions
+        uses: actions/checkout@v4
+        with:
+          repository: Golyv-LLC/golyv-actions
+          ref: ${{ inputs.actions-ref }}
+          path: .golyv-actions
+      - uses: ./.golyv-actions/actions/php-sast
+        with:
+          php-version: ${{ inputs.php-version }}
+
   sonarqube:
     if: inputs.run-sonar
     runs-on: ubuntu-latest
@@ -65,3 +102,20 @@ jobs:
         with:
           sonar-token: ${{ secrets.SONAR_TOKEN }}
           sonar-host-url: ${{ secrets.SONAR_HOST_URL }}
+
+  docker-build:
+    # Blocking on purpose: a PR that breaks the image must not merge, because
+    # the merge is what deploys.
+    if: inputs.dockerfile != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          push: false
+          cache-from: type=gha,scope=pr-${{ github.repository }}
+          cache-to: type=gha,mode=max,scope=pr-${{ github.repository }}
